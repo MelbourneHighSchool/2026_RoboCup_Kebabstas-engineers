@@ -1,0 +1,12 @@
+{
+    "python.analysis.extraPaths": [
+        "C:/Program Files/Webots/lib/controller/python"
+    ],
+    "python.analysis.diagnosticSeverityOverrides": {
+        "reportUnusedImport": "warning",
+        "reportUnusedVariable": "warning",
+        "reportUnusedClass": "warning",
+        "reportUnusedFunction": "warning",
+        "reportUnusedExpression": "warning"
+    }
+}
