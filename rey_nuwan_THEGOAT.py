@@ -1,4 +1,20 @@
-# erebus 2026 controller - left wall following + finds victims and cognitive targets
+# This program combines four major systems:
+#   1. Left-hand wall-following navigation.
+#   2. Colour-floor detection and blocked-floor avoidance.
+#   3. LiDAR mapping and side-wall scanning.
+#   4. Dual-camera victim/cognitive-target detection, alignment and reporting.
+#
+# The controller is organised as a state machine. Every Webots
+# control cycle performs only the work for the current state, then returns to
+# the top of the main loop. This keeps sensors updating while the robot moves.
+#
+# Main navigation sequence:
+#   WAIT --> MOVE --> AFTER_STEP --> direction decision --> TURN --> AFTER_TURN
+#
+# Token handling temporarily interrupts navigation. The controller stores the
+# interrupted navigation state, handles the target, and then resumes it.
+
+# Imports   
 import math
 import os
 import struct
@@ -6,9 +22,11 @@ from collections import Counter
 import cv2
 import numpy as np
 from controller import Robot
+
+
+# Device Initialisation
 robot = Robot()
 timestep = int(robot.getBasicTimeStep())
-#devices
 left_motor = robot.getDevice("wheel2 motor")
 right_motor = robot.getDevice("wheel1 motor")
 for motor in (left_motor, right_motor):
@@ -26,7 +44,8 @@ emitter = robot.getDevice("emitter")
 for device in (left_encoder, right_encoder, gps, imu, lidar, colour_sensor, camera1, camera2):
     device.enable(timestep)
 print("Emitter ready." if emitter else "WARNING: emitter not found. Token reporting is unavailable.")
-#settings
+
+# Navigation + Mapping + Controller Settings
 MAPSIZE = 241
 CELL = 0.01  # 1 char on the map is 1cm
 START_X = MAPSIZE // 2
@@ -129,20 +148,24 @@ tok = None
 last_summary = -1
 
 #helpers
+# Wheel Move
 def set_wheels(left_speed, right_speed):
     left_motor.setVelocity(left_speed)
     right_motor.setVelocity(right_speed)
-
+    
+# Wrap any angle into the range [0, 360).
 def normalize_heading(value):
     return value % 360
 
 # shortest way to turn, eg 270 vs 0 gives -90
 def angle_error(target, current):
     return (target - current + 180) % 360 - 180
-
+    
+# Snap a noisy IMU heading to the nearest multiple of 90 degrees.
 def cardinal(value):
     return normalize_heading(round(value / 90) * 90)
 
+# Reject startup readings containing NaN or infinity.
 def imu_is_ready():
     return all(math.isfinite(v) for v in imu.getRollPitchYaw())
 
@@ -154,7 +177,7 @@ def get_relative_heading():
     if start_heading is None:
         return 0.0
     return normalize_heading(get_absolute_imu_heading() - start_heading)
-
+# Average wheel positions provide a simple one-dimensional movement reference for straight driving, creeping and target approach distances.
 def average_encoder():
     return (left_encoder.getValue() + right_encoder.getValue()) / 2
 
@@ -176,6 +199,9 @@ def gps_to_map():
     return map_x, map_z, relative_forward, relative_right
 
 # drives forward and steers back onto the heading
+# Proportional heading correction: slow one wheel slightly until the current
+# IMU heading returns to the cardinal heading captured at step start.
+
 def drive_straight(speed, hold_heading):
     correction = angle_error(hold_heading, heading) * KP
     correction = max(-MAX_CORR, min(MAX_CORR, correction))
@@ -199,13 +225,17 @@ def turn_toward(goal_heading):
     set_wheels(-speed, speed) if error > 0 else set_wheels(speed, -speed)
     return False
 
-#floor
+# Floor Colour Tiles
+
+# Read the single colour-sensor pixel and return an RGB tuple.
 def read_colour():
     image = colour_sensor.getImage()
     width = colour_sensor.getWidth()
     return (colour_sensor.imageGetRed(image, width, 0, 0), colour_sensor.imageGetGreen(image, width, 0, 0), colour_sensor.imageGetBlue(image, width, 0, 0))
 
 # brown goes before yellow cause swamps pass the yellow check too
+# Apply calibrated channel limits and dominance tests. Return a floor name or
+# None for ordinary traversable floor.
 def classify_floor(red, green, blue):
     if red < BLACK_MAX and green < BLACK_MAX and blue < BLACK_MAX:
         return "black"
@@ -225,10 +255,14 @@ def classify_floor(red, green, blue):
         return "red"
     return None
 
+# Convenience check used during target creeping/approach to stop before any
+# currently blocked floor type.
 def blocked_floor_detected():
     name = classify_floor(*read_colour())
     return name is not None and FLOORS[name]["blocked"]
 
+# Merge the saved coordinate sets of every floor type whose blocked flag is
+# currently True.
 def blocked_cells():
     cells = set()
     for region in FLOORS.values():
@@ -236,7 +270,9 @@ def blocked_cells():
             cells |= region["cells"]
     return cells
 
-# checks the next 12cm in that direction for known bad floor
+# checks the next 12cm (1 tile forward) in that direction for known bad floor
+# Project a 12 cm centreline from the robot in a proposed relative direction.
+# Reject the direction if any projected 1 cm cell is known blocked floor.
 def direction_has_blocked_floor(turn_amount):
     map_x, map_z, _, _ = gps_to_map()
     angle = math.radians(-normalize_heading(heading + turn_amount))
@@ -248,6 +284,9 @@ def direction_has_blocked_floor(turn_amount):
     return False
 
 # paints the floor colour forward on the map till it hits a wall
+# Paint a nine-cell-wide semantic strip ahead of the colour-sensor detection.
+# Expansion stops at walls, unknown space or another map symbol so the code does
+# not blindly label unseen space as hazardous floor.
 def mark_floor_region(detected_x, detected_z, robot_heading, name):
     region = FLOORS[name]
     symbol, saved_cells = region["symbol"], region["cells"]
@@ -270,11 +309,15 @@ def mark_floor_region(detected_x, detected_z, robot_heading, name):
                 break
     print(f"Known {region['hazard']} cells:", len(saved_cells))
 
-#lidar (only layer 2 works properly)
+# LIDAR HELPERS
+
+# Lidar (layer 2 most reliable)
 def get_layer_2():
     return lidar.getRangeImage()[2 * resolution:3 * resolution]
-
+    
 # closest reading around that ray
+# Return the nearest finite reading around a direction. Minimum distance is used
+# for conservative collision safety.
 def sector_distance(centre_index, width=15):
     layer = get_layer_2()
     values = [layer[(centre_index + offset) % resolution] for offset in range(-width, width + 1)]
@@ -296,10 +339,17 @@ def get_left_lidar():
 def get_left_turn_clearance():
     return sector_distance(LEFT_IDX, width=5)
 
+# Use a narrow two-ray neighbourhood for accurate perpendicular distance to the
+# wall associated with a side camera.
 def side_wall_distance(camera):
     return sector_distance(camera["ray"], width=2)
 
-#mapping - free space along each ray and a wall where it ends
+# Each finite LiDAR ray marks free space along its path and a wall at its end.
+# Semantic floor symbols are restored afterwards so wall updates cannot erase
+# previously classified floor regions.
+# mapping - free space along each ray and a wall where it ends
+# Convert every layer-2 LiDAR ray from robot-relative polar coordinates into
+# grid coordinates using the current relative heading.
 def scan_map(map_x, map_z, robot_heading, mark_scanned=False):
     layer = get_layer_2()
     heading_radians = math.radians(-robot_heading)
@@ -329,7 +379,12 @@ def scan_map(map_x, map_z, robot_heading, mark_scanned=False):
             if in_map(x, z):
                 grid[z][x] = region["symbol"]
 
-#navigation - left hand rule: left, front, right, back
+# Directions are considered in fixed priority: left, front, right, back. A
+# direction must satisfy LiDAR clearance and contain no mapped blocked floor.
+# Navigation - left hand rule: left, front, right, back
+# Measure all four cardinal directions, print the evidence and return a relative
+# turn amount: +90 left, 0 straight, -90 right. The Back choice intentionally
+# returns -90 first; a later boundary decision completes the staged turnaround.
 def choose_boundary_direction():
     clearances = {"Left":  (get_left_turn_clearance(), SIDE_CLEAR, 90), "Front": (get_front_lidar(), FRONT_CLEAR, 0), "Right": (get_right_lidar(), SIDE_CLEAR, -90), "Back":  (get_back_lidar(), SIDE_CLEAR, 180),}
     safe = {}
@@ -347,6 +402,7 @@ def choose_boundary_direction():
     print("Decision: no safe direction.")
     return None
 
+# Capture encoder baselines and the nearest cardinal heading, then enter MOVE.
 def start_new_step():
     global state, target_heading, start_l, start_r
     start_l = left_encoder.getValue()
@@ -354,6 +410,8 @@ def start_new_step():
     target_heading = cardinal(heading)
     state = "MOVE"
 
+# Convert a relative turn request into an absolute target heading in the
+# controller's start-relative coordinate system.
 def start_turn(turn_amount):
     global state, target_heading
     current = cardinal(heading)
@@ -361,6 +419,7 @@ def start_turn(turn_amount):
     print("Starting turn:", round(current, 2), "degrees to", round(target_heading, 2), "degrees")
     state = "TURN"
 
+# Stop immediately after blocked floor is detected, remember how much of the current movement occurred, and prepare to reverse at least 0.5 encoder radians before performing a forced right turn.
 def begin_floor_avoidance(average_change, hazard_name):
     global state, rev_target, rev_l, rev_r
     global turn_after, dodging_hole, detour_steps, last_hazard
@@ -374,7 +433,10 @@ def begin_floor_avoidance(average_change, hazard_name):
     detour_steps = 0
     state = "REVERSE"
 
-#printing the map
+# printing the map
+# Copy the persistent map so temporary display symbols S, R and W do not alter
+# stored occupancy. Only the bounding rectangle containing known cells is
+# printed, with a two-cell margin.
 def print_map(robot_x, robot_z):
     display = [row.copy() for row in grid]
     for x, z in side_walls:
@@ -405,7 +467,9 @@ def print_map(robot_x, robot_z):
     for row in range(top, bottom + 1):
         print("".join(display[row][left:right + 1]))
     print("========================================")
-
+    
+# Stop the robot, perform one final scan, print statistics and the cropped map,
+# then remain in FINISHED for all later control cycles.
 def finish(reason):
     global state
     set_wheels(0, 0)
