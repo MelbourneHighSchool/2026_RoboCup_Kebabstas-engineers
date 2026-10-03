@@ -1,10 +1,8 @@
-# This program combines five major systems:
+# This program combines four major systems:
 #   1. Left-hand wall-following navigation.
 #   2. Colour-floor detection and blocked-floor avoidance.
 #   3. LiDAR mapping and side-wall scanning.
 #   4. Dual-camera victim/cognitive-target detection, alignment and reporting.
-#   5. Back-to-start exit: when the robot is home and there is no time for
-#      another lap, it tells the supervisor it is leaving.
 #
 # The controller is organised as a state machine. Every Webots
 # control cycle performs only the work for the current state, then returns to
@@ -15,6 +13,12 @@
 #
 # Token handling temporarily interrupts navigation. The controller stores the
 # interrupted navigation state, handles the target, and then resumes it.
+#
+# Phase 1: one lap of left-hand wall following. The lap is finished when GPS
+# says the robot is back near where it started.
+# Phase 2: floating walls. Wall following only reaches walls that are joined to
+# the one being followed, so after the lap the robot plans routes to every
+# unvisited spot beside a wall (or unseen space) until none are left.
 #
 # 180 degree turns are done as two 90 degree turns. The first 90 is slow and is
 # followed by a pause where both cameras check for tokens.
@@ -46,11 +50,8 @@ colour_sensor = robot.getDevice("colour_sensor")
 camera1 = robot.getDevice("camera1")
 camera2 = robot.getDevice("camera2")
 emitter = robot.getDevice("emitter")
-receiver = robot.getDevice("receiver")
 for device in (left_encoder, right_encoder, gps, imu, lidar, colour_sensor, camera1, camera2):
     device.enable(timestep)
-if receiver:
-    receiver.enable(timestep)
 print("Emitter ready." if emitter else "WARNING: emitter not found. Token reporting is unavailable.")
 
 # Navigation + Mapping + Controller Settings
@@ -59,10 +60,7 @@ CELL = 0.01  # 1 char on the map is 1cm
 START_X = MAPSIZE // 2
 START_Z = MAPSIZE // 2
 STEP_ENC = 2.95  # about 6cm
-MAX_STEPS = 50000  # just for testing
-GAME_TIME = 480  # seconds in a run, used until the supervisor sends the real time left
-BACK_MARGIN = 0.01  # m, how close to the start position counts as being back at the start
-LEAVE_DIST = 0.15  # m, the robot must get this far from the start before a return counts
+MAX_STEPS = 50000
 SPEED = 6.275
 BACK_SPEED = 6.275
 TURN_FAST = 6.275
@@ -77,6 +75,11 @@ LEFT_CONE = 15  # lidar rays either side used to check a left turn (was 5). Same
 NODE = 6  # cm between route spots (one drive step)
 MARGIN = 3  # cm of side room the robot needs when planning a route
 WALL_NEAR = 9  # a spot this close (cm) to a wall or unknown space is worth visiting
+LAP_AWAY = 0.30  # m the robot must get from the start before coming back counts as a lap
+LAP_HOME = 0.10  # m from the start (GPS) that counts as back home
+STALL_STEPS = 30  # steps without reaching a new spot before the lap is ended early
+GO_HOME_AFTER = 3  # empty plans in a row (10 steps apart) before it decides everything is explored and drives back to the start
+LAP_MAX_STEPS = 300  # give up waiting for a lap after this many steps and go on to phase 2
 REVISIT_LIMIT = 2  # same spot + heading seen this many times = wall following is going round in circles
 LOOP_LIMIT = 3  # same spot + same heading this many times = stuck in a loop, so left stops being the first choice there
 KP = 0.04
@@ -102,7 +105,8 @@ RED_MIN, RED_OTHER, RED_DIFF = 200, 150, 60
 # colour sensor is a bit in front of the gps
 FLOOR_OFFSET = 2
 # symbol, blocked or not, name for printing
-FLOORS = {"black":  {"symbol": "H", "blocked": True,  "hazard": "black hole",     "log": "BLACK FLOOR"}, "brown":  {"symbol": "M", "blocked": True,  "hazard": "brown floor",    "log": "BROWN FLOOR"}, "green":  {"symbol": "G", "blocked": True,  "hazard": "green passage",  "log": "GREEN PASSAGE"}, "yellow": {"symbol": "Y", "blocked": True,  "hazard": "yellow passage", "log": "YELLOW PASSAGE"}, "purple": {"symbol": "P", "blocked": True,  "hazard": "purple passage", "log": "PURPLE PASSAGE"}, "red":    {"symbol": "r", "blocked": True,  "hazard": "red passage",    "log": "RED PASSAGE"}, "silver": {"symbol": "C", "blocked": False, "hazard": "checkpoint",     "log": "SILVER CHECKPOINT"},}
+FLOORS = {"black":  {"symbol": "H", "blocked": True,  "hazard": "black hole",     "log": "BLACK FLOOR"}, "brown":  {"symbol": "M", "blocked": True,  "hazard": "brown floor",    "log": "BROWN FLOOR"}, "green":  {"symbol": "G", "blocked": False,  "hazard": "green passage",  "log": "GREEN PASSAGE"}, "yellow": {"symbol": "Y", "blocked": False,  "hazard": "yellow passage", "log": "YELLOW PASSAGE"}, "purple": {"symbol": "P", "blocked": False,  "hazard": "purple passage", "log": "PURPLE PASSAGE"}, "red":    {"symbol": "r", "blocked": False,  "hazard": "red passage",    "log": "RED PASSAGE"}, "silver": {"symbol": "C", "blocked": False, "hazard": "checkpoint",     "log": "SILVER CHECKPOINT"}, "blue":   {"symbol": "B", "blocked": False, "hazard": "blue passage",   "log": "BLUE PASSAGE"},
+ }
 for region in FLOORS.values():
     region["cells"] = set()
 FLOOR_SYMS = {region["symbol"] for region in FLOORS.values()}
@@ -115,6 +119,7 @@ APPROACH_SPD = 2.0
 LENS_OFFSET = 0.0275  # worked out from the camera pics, it fixes itself while driving
 TARGET_R = 0.025  # target is 5cm across
 ALIGN_TOL = 3
+OFFCENTRE_FRAC = 0.3  # if the token cannot be centred (blocked by a perpendicular wall) read it anyway when it is within this fraction of the image width from the middle
 TRIGGER_PX = 10  # wait till its this close to the middle when driving
 ALIGN_KP = 0.12
 CREEP_MIN = 0.5
@@ -165,6 +170,12 @@ dodging_hole = False
 detour_steps = 0
 uturn_pending = False  # true while doing the first 90 of a 180
 slow_steps = 0  # steps left to drive slowly after a turn
+lap_done = False  # phase 1 (one wall-following lap) finished
+lap_away = 0.0  # furthest the robot has been from the start (GPS, m)
+next_plan_step = 0  # do not plan another route before this total step
+route_mode = "wall"  # what the current route is for: wall, any or home
+empty_plans = 0  # plans in a row that found nothing left to visit
+stall_steps = 0  # steps in a row that did not reach a new spot
 decision_counts = Counter()  # how many times a decision was made at each (spot, heading)
 visited = {(0, 0)}  # 6 cm spots the robot has stood on, in the start frame
 step_states = Counter()  # (spot, heading) after each step, used to spot circles
@@ -175,11 +186,6 @@ unreachable = set()  # goals we gave up on
 seen_tokens = []  # every token we dealt with already
 tok = None
 last_summary = -1
-remaining_time = GAME_TIME  # seconds left, updated from the supervisor
-start_position = None  # gps position where the run began
-left_start = False  # true once the robot has driven away from the start
-loop_time = None  # seconds the first trip back to the start took
-exit_sent = False
 
 #helpers
 # Wheel Move
@@ -525,14 +531,25 @@ def worth_visiting(node):
                 return True
     return False
 
-# nearest unvisited spot worth visiting, as a list of spots (None if there isn't one)
-def plan_route():
+# what counts as a goal: wall = unvisited spot beside a wall or unseen space,
+# any = unvisited spot on a 12 cm lattice (open floor), home = the given spot
+def is_target(node, mode, goal):
+    if mode == "home":
+        return node == goal
+    if node in visited or node in unreachable:
+        return False
+    if mode == "wall":
+        return worth_visiting(node)
+    return node[0] % 2 == 0 and node[1] % 2 == 0
+
+# nearest goal as a list of spots (None if there isn't one)
+def plan_route(mode="wall", goal=None):
     start = current_node()
     previous = {start: None}
     queue = deque([start])
     while queue:
         node = queue.popleft()
-        if node != start and node not in visited and node not in unreachable and worth_visiting(node):
+        if node != start and is_target(node, mode, goal):
             path = []
             while node != start:
                 path.append(node)
@@ -558,7 +575,7 @@ def follow_route():
     delta = (route[0][0] - here[0], route[0][1] - here[1])
     if delta not in STEP_HEADING:
         # drifted off the route, plan again from here
-        path = plan_route()
+        path = plan_route(route_mode, (0, 0) if route_mode == "home" else None)
         if not path:
             travelling = False
             return False
@@ -578,18 +595,39 @@ def follow_route():
     start_new_step()
     return True
 
-# called when wall following is going round in circles, True if the state changed
+# called when it is time to go somewhere new, True if the state changed.
+# Order of preference: unvisited spots beside walls (floating walls), then any
+# unvisited open floor, then (after nothing is left three times in a row) home.
 def start_exploring():
-    global travelling, route_goal, uturn_pending
+    global travelling, route_goal, route_mode, uturn_pending, next_plan_step, empty_plans
     uturn_pending = False
-    path = plan_route()
+    mode = "wall"
+    path = plan_route("wall")
     if path is None:
-        finish("every reachable spot beside a wall has been visited")
-        return True
+        mode = "any"
+        path = plan_route("any")
+    if path is None:
+        empty_plans += 1
+        next_plan_step = total_steps + 10
+        if empty_plans < GO_HOME_AFTER:
+            print("Nothing new reachable right now: wall following, looking again in 10 steps.")
+            return False
+        if current_node() == (0, 0):
+            finish("everything reachable has been visited and the robot is back at the start")
+            return True
+        mode = "home"
+        path = plan_route("home", (0, 0))
+        if path is None:
+            finish("everything reachable has been visited (no route back to the start)")
+            return True
+        print("Everything reachable has been visited: going back to the start.")
+    else:
+        empty_plans = 0
     route[:] = path
     route_goal = path[-1]
+    route_mode = mode
     travelling = True
-    print("Heading for unvisited spot", route_goal, "|", len(path), "steps away")
+    print("Heading for", mode, "spot", route_goal, "|", len(path), "steps away")
     if follow_route():
         return True
     travelling = False
@@ -650,6 +688,7 @@ def finish(reason):
     print("Wall tokens reported:", len(reported), [t["type"] for t in reported])
     print("Wall tokens ignored:", sum(1 for t in seen_tokens if t["status"] != "reported"))
     print_map(final_x, final_z)
+    state = "FINISHED"
 
 #vision - erebus colours are flat so simple thresholds work fine
 def get_frame(camera):
@@ -903,7 +942,7 @@ def classify_glyph(glyph):
     return letter, features
 
 # only reads it if the whole letter is in the pic
-def detect_victim(labels, near_wall, min_read_side=11):
+def detect_victim(labels, near_wall, min_read_side=8):
     found = find_plaque(labels, near_wall)
     if found is None:
         return None
@@ -968,22 +1007,28 @@ def estimate_token_position(camera, wall_distance, error_px):
     forward_x, forward_z = -math.sin(angle), -math.cos(angle)
     right_x, right_z = math.cos(angle), -math.sin(angle)
     position = gps.getValues()
-    return (position[0] + forward_x * ahead + camera["side"] * right_x * wall_distance, position[2] + forward_z * ahead + camera["side"] * right_z * wall_distance)
+    # x, z of the token plus the direction the camera is looking (so the two faces of a thin wall are different tokens)
+    return (position[0] + forward_x * ahead + camera["side"] * right_x * wall_distance, position[2] + forward_z * ahead + camera["side"] * right_z * wall_distance, camera["side"] * right_x, camera["side"] * right_z)
 
-def find_known_token(position):
+# same token = same kind, same wall face and close together
+def find_known_token(position, kind=None):
     for entry in seen_tokens:
+        if kind is not None and entry["kind"] != kind:
+            continue
+        if entry["nx"] * position[2] + entry["nz"] * position[3] <= 0:
+            continue
         if math.hypot(entry["x"] - position[0], entry["z"] - position[1]) < SAME_TOKEN_DIST:
             return entry
     return None
 
-def token_is_handled(position):
-    entry = find_known_token(position)
+def token_is_handled(position, kind=None):
+    entry = find_known_token(position, kind)
     return entry is not None and (entry["status"] in ("reported", "ignored") or entry["attempts"] >= MAX_TRIES)
 
-def remember_token(position, status, token_type=None):
-    entry = find_known_token(position)
+def remember_token(position, status, token_type=None, kind=None):
+    entry = find_known_token(position, kind)
     if entry is None:
-        entry = {"x": position[0], "z": position[1], "status": status, "attempts": 0, "type": None}
+        entry = {"x": position[0], "z": position[1], "nx": position[2], "nz": position[3], "kind": kind, "status": status, "attempts": 0, "type": None}
         seen_tokens.append(entry)
     entry["status"] = status
     entry["type"] = token_type or entry["type"]
@@ -1012,7 +1057,7 @@ def print_vision_summary():
         if sighting is not None:
             if not math.isfinite(wall) or wall > MAX_WALL:
                 note = " | wall too far, ignored"
-            elif token_is_handled(estimate_token_position(camera, wall, image_error(camera, sighting))):
+            elif token_is_handled(estimate_token_position(camera, wall, image_error(camera, sighting)), sighting["kind"]):
                 note = " | already handled"
         print(f"  {camera['name']:14s} | wall {wall:.3f} m | {describe(sighting)}{note}")
 
@@ -1037,7 +1082,7 @@ def look_for_new_token(resume_state):
         if not math.isfinite(wall) or wall > MAX_WALL:
             continue
         position = estimate_token_position(camera, wall, image_error(camera, sighting))
-        if token_is_handled(position):
+        if token_is_handled(position, sighting["kind"]):
             continue
         if sighting["kind"] == "cognitive":
             if track_bands is None or previous is None:
@@ -1063,7 +1108,7 @@ def begin_token(camera, sighting, position, resume_state, track_bands=None):
     bands = [Counter() for _ in range(5)]
     if sighting["kind"] == "cognitive":
         add_bands(bands, track_bands or sighting["bands"])
-    tok = {"bands": bands, "scanned": False, "scan_targets": [], "after_scan": "", "read_type": None, "camera": camera, "kind": sighting["kind"], "position": position, "resume_state": resume_state, "move_progress": ((left_encoder.getValue() - start_l) + (right_encoder.getValue() - start_r)) / 2, "pause_encoder": average_encoder(), "base_heading": cardinal(heading), "align_start": average_encoder(), "segment_direction": None, "segment_start": 0.0, "segment_error": 0.0, "lost_frames": 0, "last_drive": 0, "recover_drive": 0, "settle": 0, "approached": False, "approach_start": 0.0, "approach_distance": 0.0, "align_votes": Counter(), "votes": Counter(), "report_start": 0.0, "hold": 0,}
+    tok = {"bands": bands, "scanned": False, "scan_targets": [], "after_scan": "", "read_type": None, "camera": camera, "kind": sighting["kind"], "position": position, "resume_state": resume_state, "move_progress": ((left_encoder.getValue() - start_l) + (right_encoder.getValue() - start_r)) / 2, "pause_encoder": average_encoder(), "base_heading": cardinal(heading), "align_start": average_encoder(), "segment_direction": None, "segment_start": 0.0, "segment_error": 0.0, "lost_frames": 0, "last_drive": 0, "recover_drive": 0, "settle": 0, "approached": False, "approach_start": 0.0, "approach_distance": 0.0, "align_votes": Counter(), "votes": Counter(), "report_start": 0.0, "hold": 0, "off_px": 0.0,}
     print()
     print("========================================")
     print("NEW WALL TOKEN SEEN")
@@ -1080,7 +1125,7 @@ def begin_token(camera, sighting, position, resume_state, track_bands=None):
 # give up (can retry once)
 def abort_token(reason):
     set_wheels(0, 0)
-    remember_token(tok["position"], "failed")
+    remember_token(tok["position"], "failed", None, tok["kind"])
     print()
     print("TOKEN ABORTED:", reason)
     end_token()
@@ -1182,7 +1227,7 @@ def resolve_reading(after):
         return None
     if reading in ("fake", "flat"):
         print("Not a valid hazard (" + reading + "): not reported.")
-        remember_token(tok["position"], "ignored", reading)
+        remember_token(tok["position"], "ignored", reading, tok["kind"])
         end_token()
         return None
     return reading
@@ -1190,7 +1235,7 @@ def resolve_reading(after):
 def send_and_hold(code):
     global state
     if send_report(code):
-        remember_token(tok["position"], "reported", code)
+        remember_token(tok["position"], "reported", code, tok["kind"])
         tok["hold"] = HOLD_STEPS
         state = "TOKEN_HOLD"
     else:
@@ -1202,61 +1247,12 @@ def finish_report():
     code = resolve_reading("TOKEN_MEASURE")
     if code:
         send_and_hold(code)
-
-# Read the supervisor's game-info packets (b"G", score, seconds left) to keep the clock.
-def receive():
-    global remaining_time
-    if not receiver:
-        return
-    while receiver.getQueueLength() > 0:
-        data = receiver.getBytes()
-        if len(data) == 9:
-            tag, _, seconds_left = struct.unpack("<cfi", data)
-            if tag == b"G":
-                remaining_time = seconds_left
-        receiver.nextPacket()
-
-# Called every control cycle. The first time the robot gets back to where it
-# started, the time that trip took is saved as the length of one lap. Every time
-# it is back at the start after that, if the time left is not enough for another
-# lap it sends the exit signal and stops.
-def back_to_start():
-    global start_position, left_start, loop_time, exit_sent
-    if state == "WAIT" or exit_sent:
-        return
-    position = gps.getValues()
-    if start_position is None:
-        start_position = position
-        return
-    at_start = all(abs(position[i] - start_position[i]) <= BACK_MARGIN for i in range(3))
-    if not at_start:
-        if not left_start:
-            moved = math.hypot(position[0] - start_position[0], position[2] - start_position[2])
-            if moved >= LEAVE_DIST:
-                left_start = True
-        return
-    if not left_start:
-        return
-    left_start = False  # one check per return, needs to leave again before the next
-    if loop_time is None:
-        loop_time = GAME_TIME - remaining_time
-        print("Back at the start. First lap took", loop_time, "s")
-    print("Back at the start | time left:", remaining_time, "s | lap time:", loop_time, "s")
-    if remaining_time <= loop_time:
-        print("Not enough time for another lap: sending exit signal.")
-        if emitter:
-            emitter.send(bytes("E", "utf-8"))
-        exit_sent = True
-        finish("back at the start with no time for another lap")
-
 #main loop
 print("Hazard-aware left-boundary wall-following controller started. [token controller v4]")
 print("Camera FOV (rad):", round(camera1.getFov(), 3), round(camera2.getFov(), 3))
 while robot.step(timestep) != -1:
     if start_heading is not None:
         heading = get_relative_heading()
-    receive()
-    back_to_start()
     # first scan
     if state == "WAIT":
         set_wheels(0, 0)
@@ -1297,6 +1293,14 @@ while robot.step(timestep) != -1:
         front_clearance = get_front_lidar()
         if front_clearance < STOP_DIST:
             set_wheels(0, 0)
+            if travelling:
+                # a planned step that ends right at a wall: count it as done instead of abandoning the route
+                slow_steps = max(0, slow_steps - 1)
+                pass_steps += 1
+                total_steps += 1
+                wait_steps = 8
+                state = "AFTER_STEP"
+                continue
             print()
             print("Front wall reached. Front clearance:", round(front_clearance, 4), "m")
             state = "END_PASS"
@@ -1333,21 +1337,39 @@ while robot.step(timestep) != -1:
         if total_steps >= MAX_STEPS:
             finish("temporary total-step limit reached")
             continue
-        # floating-wall escape: follow a planned route, or plan one if we keep coming back to the same spot
+        # phase 1 = one wall-following lap (GPS says when we are home), phase 2 = visit every spot beside a wall
         if travelling:
             if follow_route():
                 continue
-            print("Route finished. Back to wall following.")
+            print("Route finished.")
+            if route_mode == "home" and current_node() == (0, 0):
+                finish("everything reachable has been visited and the robot is back at the start")
+                continue
         else:
             here_node = current_node()
+            stall_steps = 0 if here_node not in visited else stall_steps + 1
             visited.add(here_node)
             key = (here_node, int(cardinal(heading)))
             step_states[key] += 1
-            if step_states[key] >= REVISIT_LIMIT and not dodging_hole:
-                step_states[key] = 0
-                print("Same spot and heading again: wall following is going round in circles.")
-                if start_exploring():
-                    continue
+            if not lap_done:
+                now = gps.getValues()
+                away = math.hypot(now[0] - start_gps[0], now[2] - start_gps[1])
+                lap_away = max(lap_away, away)
+                if lap_away >= LAP_AWAY and away <= LAP_HOME:
+                    lap_done = True
+                    print("LAP COMPLETE: back at the start (GPS", round(away, 3), "m away). Now checking floating walls.")
+                elif stall_steps >= STALL_STEPS:
+                    lap_done = True
+                    print("No new ground for", stall_steps, "steps: ending the lap early. Now checking floating walls.")
+                elif step_states[key] >= REVISIT_LIMIT:
+                    lap_done = True
+                    print("Same spot and heading again before reaching the start: ending the lap early. Now checking floating walls.")
+                elif total_steps >= LAP_MAX_STEPS:
+                    lap_done = True
+                    print("Lap step limit reached. Now checking floating walls.")
+        if lap_done and not travelling and not dodging_hole and total_steps >= next_plan_step:
+            if start_exploring():
+                continue
         if dodging_hole:
             detour_steps += 1
             print("Black-hole detour step:", detour_steps, "of at least", MIN_STEPS_LEFT)
@@ -1519,7 +1541,15 @@ while robot.step(timestep) != -1:
         speed = max(CREEP_MIN, min(CREEP_MAX, ALIGN_KP * abs(error)))
         problem = creep(direction, speed)
         if problem:
-            abort_token(problem)
+            # e.g. a victim on a half wall beside a perpendicular wall: we cannot get level with it, so read it from where we are
+            if abs(error) <= OFFCENTRE_FRAC * camera["device"].getWidth():
+                set_wheels(0, 0)
+                tok["off_px"] = error
+                tok["settle"] = SETTLE
+                print(f"Cannot centre ({problem}). Reading from here, {error:.1f} px off centre: {describe(sighting)}")
+                state = "TOKEN_MEASURE"
+            else:
+                abort_token(problem)
     # close enough to report?
     elif state == "TOKEN_MEASURE":
         set_wheels(0, 0)
@@ -1528,7 +1558,7 @@ while robot.step(timestep) != -1:
             continue
         camera = tok["camera"]
         wall = side_wall_distance(camera)
-        tok["position"] = estimate_token_position(camera, wall, 0.0)
+        tok["position"] = estimate_token_position(camera, wall, tok["off_px"])
         print("Side wall distance at token:", round(wall, 4), "m (report limit", REPORT_DIST, "m)")
         if wall <= REPORT_DIST:
             tok["report_start"] = robot.getTime()
@@ -1606,7 +1636,7 @@ while robot.step(timestep) != -1:
     elif state == "TOKEN_REPORT":
         set_wheels(0, 0)
         sighting = look(tok["camera"], tok["kind"])
-        if sighting and (sighting["kind"] == "cognitive" or abs(image_error(tok["camera"], sighting)) <= 2 * ALIGN_TOL):
+        if sighting and (sighting["kind"] == "cognitive" or abs(image_error(tok["camera"], sighting)) <= max(2 * ALIGN_TOL, abs(tok["off_px"]) + ALIGN_TOL)):
             collect_reading(sighting)
         if robot.getTime() - tok["report_start"] >= STOP_TIME:
             finish_report()
@@ -1629,4 +1659,6 @@ while robot.step(timestep) != -1:
     elif state == "TOKEN_RETURN_TURN_BACK":
         if turn_toward(tok["base_heading"]):
             resume_navigation()
+    elif state == "FINISHED":
+        set_wheels(0, 0)
 set_wheels(0, 0)
