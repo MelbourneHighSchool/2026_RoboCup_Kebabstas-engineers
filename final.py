@@ -78,6 +78,13 @@ WALL_NEAR = 9  # a spot this close (cm) to a wall or unknown space is worth visi
 LAP_AWAY = 0.30  # m the robot must get from the start before coming back counts as a lap
 LAP_HOME = 0.10  # m from the start (GPS) that counts as back home
 STALL_STEPS = 30  # steps without reaching a new spot before the lap is ended early
+GAME_TIME = 480.0  # s, length of the run (8 min); set this to your event's time limit
+MAP_SEND_BEFORE_END = 15.0  # s: send the map this long before the run ends if exploring has not finished
+STUCK_MOVE = 0.02  # m: a 6 cm step that moved the robot less than this (GPS) means it is jammed
+TURN_WATCH_TIME = 1.5  # s between checks that a turn is getting closer to its target
+UNSTICK_BACK_DIST = 0.03  # m to reverse when jammed (a bit more each time it happens again)
+UNSTICK_TIME = 1.2  # s limit on reversing
+GIVE_UP_PLANS = 40  # empty plans in a row before it goes home even though unvisited free spots remain that it cannot reach
 GO_HOME_AFTER = 3  # empty plans in a row (10 steps apart) before it decides everything is explored and drives back to the start
 LAP_MAX_STEPS = 300  # give up waiting for a lap after this many steps and go on to phase 2
 REVISIT_LIMIT = 2  # same spot + heading seen this many times = wall following is going round in circles
@@ -91,6 +98,7 @@ SIDE_CLEAR = 0.096
 MIN_STEPS_LEFT = 2  # steps to go after a hole before trying left again
 #floor colours (from the sensor readings)
 BLACK_MAX = 80
+BLUE_MIN, BLUE_OTHER, BLUE_DIFF = 180, 150, 60
 GREEN_MIN, GREEN_OTHER, GREEN_DIFF = 170, 160, 45
 YEL_R, YEL_G = 170, 170
 YEL_B, YEL_RG = 150, 100
@@ -105,11 +113,12 @@ RED_MIN, RED_OTHER, RED_DIFF = 200, 150, 60
 # colour sensor is a bit in front of the gps
 FLOOR_OFFSET = 2
 # symbol, blocked or not, name for printing
-FLOORS = {"black":  {"symbol": "H", "blocked": True,  "hazard": "black hole",     "log": "BLACK FLOOR"}, "brown":  {"symbol": "M", "blocked": True,  "hazard": "brown floor",    "log": "BROWN FLOOR"}, "green":  {"symbol": "G", "blocked": False,  "hazard": "green passage",  "log": "GREEN PASSAGE"}, "yellow": {"symbol": "Y", "blocked": False,  "hazard": "yellow passage", "log": "YELLOW PASSAGE"}, "purple": {"symbol": "P", "blocked": False,  "hazard": "purple passage", "log": "PURPLE PASSAGE"}, "red":    {"symbol": "r", "blocked": False,  "hazard": "red passage",    "log": "RED PASSAGE"}, "silver": {"symbol": "C", "blocked": False, "hazard": "checkpoint",     "log": "SILVER CHECKPOINT"}, "blue":   {"symbol": "B", "blocked": False, "hazard": "blue passage",   "log": "BLUE PASSAGE"},
- }
+FLOORS = {"black":  {"symbol": "H", "blocked": True,  "hazard": "black hole",     "log": "BLACK FLOOR"}, "brown":  {"symbol": "M", "blocked": False,  "hazard": "brown floor",    "log": "BROWN FLOOR"}, "green":  {"symbol": "G", "blocked": False,  "hazard": "green passage",  "log": "GREEN PASSAGE"}, "yellow": {"symbol": "Y", "blocked": False,  "hazard": "yellow passage", "log": "YELLOW PASSAGE"}, "purple": {"symbol": "P", "blocked": False,  "hazard": "purple passage", "log": "PURPLE PASSAGE"}, "red":    {"symbol": "r", "blocked": False,  "hazard": "red passage",    "log": "RED PASSAGE"}, "silver": {"symbol": "C", "blocked": False, "hazard": "checkpoint",     "log": "SILVER CHECKPOINT"}, "blue":   {"symbol": "B", "blocked": False, "hazard": "blue passage",   "log": "BLUE PASSAGE"},}
 for region in FLOORS.values():
     region["cells"] = set()
 FLOOR_SYMS = {region["symbol"] for region in FLOORS.values()}
+# map symbols the route planner may drive through: free floor plus every floor type that is not blocked
+PASSABLE = {"."} | {region["symbol"] for region in FLOORS.values() if not region["blocked"]}
 #token stuff, distances are from robot centre to the wall
 MAX_WALL = 0.12
 REPORT_DIST = 0.057  # rules say half a tile (6cm)
@@ -176,6 +185,17 @@ next_plan_step = 0  # do not plan another route before this total step
 route_mode = "wall"  # what the current route is for: wall, any or home
 empty_plans = 0  # plans in a row that found nothing left to visit
 stall_steps = 0  # steps in a row that did not reach a new spot
+map_sent = False  # the map has been submitted
+step_start_gps = None  # GPS at the start of the current 6 cm step
+turn_watch = None  # (time, angle error) used to see whether a turn is progressing
+stuck_streak = 0  # jams close together in a row
+last_stuck_step = -100
+unstick_start = None
+unstick_time = 0.0
+unstick_dist = UNSTICK_BACK_DIST
+route_budget = 0  # moves (turns and steps) left before a route is given up as going nowhere
+last_reach = 0  # how many spots the last route search could reach (for the console report)
+resets_left = 3  # times the list of given-up spots may be cleared
 decision_counts = Counter()  # how many times a decision was made at each (spot, heading)
 visited = {(0, 0)}  # 6 cm spots the robot has stood on, in the start frame
 step_states = Counter()  # (spot, heading) after each step, used to spot circles
@@ -282,6 +302,8 @@ def read_colour():
 def classify_floor(red, green, blue):
     if red < BLACK_MAX and green < BLACK_MAX and blue < BLACK_MAX:
         return "black"
+    if (blue >= BLUE_MIN and red <= BLUE_OTHER and green <= BLUE_OTHER and blue >= red + BLUE_DIFF and blue >= green + BLUE_DIFF):
+        return "blue"
     if (green >= GREEN_MIN and red <= GREEN_OTHER and blue <= GREEN_OTHER and green >= red + GREEN_DIFF and green >= blue + GREEN_DIFF):
         return "green"
     if (BRN_R_MIN <= red <= BRN_R_MAX and BRN_G_MIN <= green <= BRN_G_MAX and BRN_B_MIN <= blue <= BRN_B_MAX and abs(red - green) <= BRN_RG and green >= blue + BRN_GB):
@@ -458,7 +480,8 @@ def choose_boundary_direction():
 
 # Capture encoder baselines and the nearest cardinal heading, then enter MOVE.
 def start_new_step():
-    global state, target_heading, start_l, start_r
+    global state, target_heading, start_l, start_r, step_start_gps
+    step_start_gps = gps.getValues()
     start_l = left_encoder.getValue()
     start_r = right_encoder.getValue()
     target_heading = cardinal(heading)
@@ -467,11 +490,30 @@ def start_new_step():
 # Convert a relative turn request into an absolute target heading in the
 # controller's start-relative coordinate system.
 def start_turn(turn_amount):
-    global state, target_heading
+    global state, target_heading, turn_watch
+    turn_watch = None
     current = cardinal(heading)
     target_heading = normalize_heading(current + turn_amount)
     print("Starting turn:", round(current, 2), "degrees to", round(target_heading, 2), "degrees")
     state = "TURN"
+
+# Lack of progress from the system: the wheels turn but the robot does not get anywhere
+# (jammed on a wall corner, a half wall, another robot). Back off, then turn a different way.
+def begin_unstick(reason):
+    global state, stuck_streak, last_stuck_step, unstick_start, unstick_time, unstick_dist, travelling
+    set_wheels(0, 0)
+    stuck_streak = stuck_streak + 1 if total_steps - last_stuck_step < 10 else 1
+    last_stuck_step = total_steps
+    if travelling:
+        unreachable.add(route_goal)
+        travelling = False
+        route.clear()
+    unstick_dist = UNSTICK_BACK_DIST + 0.015 * min(stuck_streak - 1, 4)
+    unstick_start = gps.getValues()
+    unstick_time = robot.getTime()
+    print()
+    print("LACK OF PROGRESS (stuck):", reason, "| jams in a row:", stuck_streak)
+    state = "UNSTICK_BACK"
 
 # Stop immediately after blocked floor is detected, remember how much of the current movement occurred, and prepare to reverse at least 0.5 encoder radians before performing a forced right turn.
 def begin_floor_avoidance(average_change, hazard_name):
@@ -503,15 +545,17 @@ def current_node():
 
 # one 6 cm step between neighbouring spots: centre line must be known free,
 # no wall beside it (MARGIN) and no wall just past the end
-def edge_is_free(a, b):
+def edge_is_free(a, b, margin=None):
+    if margin is None:
+        margin = MARGIN
     dx, dz = b[0] - a[0], b[1] - a[1]
     px, pz = -dz, dx
     x0, z0 = START_X + a[0] * NODE, START_Z + a[1] * NODE
     for t in range(NODE + 1):
         x, z = x0 + t * dx, z0 + t * dz
-        if not in_map(x, z) or grid[z][x] not in (".", "C"):
+        if not in_map(x, z) or grid[z][x] not in PASSABLE:
             return False
-        for s in range(-MARGIN, MARGIN + 1):
+        for s in range(-margin, margin + 1):
             sx, sz = x + s * px, z + s * pz
             if in_map(sx, sz) and grid[sz][sx] == "#":
                 return False
@@ -543,7 +587,8 @@ def is_target(node, mode, goal):
     return node[0] % 2 == 0 and node[1] % 2 == 0
 
 # nearest goal as a list of spots (None if there isn't one)
-def plan_route(mode="wall", goal=None):
+def plan_route(mode="wall", goal=None, margin=None):
+    global last_reach
     start = current_node()
     previous = {start: None}
     queue = deque([start])
@@ -554,22 +599,55 @@ def plan_route(mode="wall", goal=None):
             while node != start:
                 path.append(node)
                 node = previous[node]
+            last_reach = len(previous)
             return path[::-1]
         for step in STEP_HEADING:
             nxt = (node[0] + step[0], node[1] + step[1])
-            if nxt not in previous and edge_is_free(node, nxt):
+            if nxt not in previous and edge_is_free(node, nxt, margin):
                 previous[nxt] = node
                 queue.append(nxt)
+    last_reach = len(previous)
     return None
+
+# try the normal side margin first, then a slightly tighter one
+def plan_any_margin(mode, goal=None):
+    for margin in (MARGIN, max(1, MARGIN - 1)):
+        path = plan_route(mode, goal, margin)
+        if path is not None:
+            return path
+    return None
+
+# known free open spots on the 12 cm lattice that the robot has not stood on (for the console report)
+def count_unvisited_free():
+    count = 0
+    for nx in range(-20, 21):
+        for nz in range(-20, 21):
+            if (nx, nz) in visited or nx % 2 or nz % 2:
+                continue
+            x, z = START_X + nx * NODE, START_Z + nz * NODE
+            if not in_map(x, z) or grid[z][x] not in PASSABLE:
+                continue
+            if any(in_map(x + dx, z + dz) and grid[z + dz][x + dx] == "#" for dx in range(-MARGIN, MARGIN + 1) for dz in range(-MARGIN, MARGIN + 1)):
+                continue
+            count += 1
+    return count
 
 # one move along the route (a turn or a step), False when the route is over
 def follow_route():
-    global travelling, route_goal
+    global travelling, route_goal, route_budget
     here = current_node()
     visited.add(here)
     if here in route:
         del route[:route.index(here) + 1]
     if not route:
+        travelling = False
+        return False
+    route_budget -= 1
+    if route_budget < 0:
+        # shuffling about without getting there (lack of progress): give this goal up
+        print("Route is taking too long, giving up on spot", route_goal)
+        unreachable.add(route_goal)
+        route.clear()
         travelling = False
         return False
     delta = (route[0][0] - here[0], route[0][1] - here[1])
@@ -599,33 +677,43 @@ def follow_route():
 # Order of preference: unvisited spots beside walls (floating walls), then any
 # unvisited open floor, then (after nothing is left three times in a row) home.
 def start_exploring():
-    global travelling, route_goal, route_mode, uturn_pending, next_plan_step, empty_plans
+    global travelling, route_goal, route_mode, uturn_pending, next_plan_step, empty_plans, resets_left, route_budget
     uturn_pending = False
     mode = "wall"
-    path = plan_route("wall")
+    path = plan_any_margin("wall")
     if path is None:
         mode = "any"
-        path = plan_route("any")
+        path = plan_any_margin("any")
     if path is None:
         empty_plans += 1
         next_plan_step = total_steps + 10
-        if empty_plans < GO_HOME_AFTER:
-            print("Nothing new reachable right now: wall following, looking again in 10 steps.")
+        free_left = count_unvisited_free()
+        print("No route found | spots reachable:", last_reach, "| unvisited free spots left:", free_left, "| given up on:", len(unreachable), "| empty plans:", empty_plans)
+        if unreachable and resets_left > 0:
+            resets_left -= 1
+            unreachable.clear()
+            next_plan_step = total_steps
+            print("Cleared the given-up spots to try them again.")
+            return False
+        limit = GO_HOME_AFTER if free_left == 0 else GIVE_UP_PLANS
+        if empty_plans < limit:
+            print("Wall following for now, looking again in 10 steps.")
             return False
         if current_node() == (0, 0):
             finish("everything reachable has been visited and the robot is back at the start")
             return True
         mode = "home"
-        path = plan_route("home", (0, 0))
+        path = plan_any_margin("home", (0, 0))
         if path is None:
             finish("everything reachable has been visited (no route back to the start)")
             return True
-        print("Everything reachable has been visited: going back to the start.")
+        print("Going back to the start.")
     else:
         empty_plans = 0
     route[:] = path
     route_goal = path[-1]
     route_mode = mode
+    route_budget = 3 * len(path) + 10
     travelling = True
     print("Heading for", mode, "spot", route_goal, "|", len(path), "steps away")
     if follow_route():
@@ -668,6 +756,120 @@ def print_map(robot_x, robot_z):
         print("".join(display[row][left:right + 1]))
     print("========================================")
     
+# Map bonus (Erebus): the maze as a matrix of strings. Every 6 cm quarter tile is a cell at odd/odd
+# positions, wall edges sit between them (odd/even) and wall vertices at even/even. Walls are 1, hole 2,
+# swamp 3, checkpoint 4, start tile 5, connection tiles b/p/r/g/y, victims and hazards their letter.
+# Rows run along the robot's right and columns along its forward direction at the start, which is a
+# normal top-down view turned by a multiple of 90 degrees (allowed).
+TILE_CODES = {"black": "2", "brown": "3", "silver": "4", "blue": "b", "purple": "p", "red": "r", "green": "g", "yellow": "y"}
+
+# lowest/highest tile line (units of 6 cm, always an even number) that walls were seen on
+def map_span(offsets):
+    low = 2 * round(((min(offsets) + 6) / 6) / 2)
+    high = 2 * round(((max(offsets) + 6) / 6) / 2)
+    return low, (high if high > low else low + 2)
+
+# a wall edge: at least 3 of the 7 cells along a 6 cm edge were hit by the lidar
+def edge_has_wall(cx, cz, along_x):
+    seen = set()
+    for t in range(-3, 4):
+        for s in (-1, 0, 1):
+            x, z = (cx + t, cz + s) if along_x else (cx + s, cz + t)
+            if in_map(x, z) and grid[z][x] == "#":
+                seen.add(t)
+    return len(seen) >= 3
+
+def build_map_matrix():
+    walls = {(x, z) for z in range(MAPSIZE) for x in range(MAPSIZE) if grid[z][x] == "#"}
+    # ignore stray single lidar hits so they do not stretch the map
+    solid = [(x, z) for (x, z) in walls if sum((x + dx, z + dz) in walls for dx in range(-2, 3) for dz in range(-2, 3)) >= 5]
+    if not solid:
+        return None
+    ux0, ux1 = map_span([x - START_X for x, z in solid])
+    uz0, uz1 = map_span([z - START_Z for x, z in solid])
+    cols, rows = 2 * (ux1 - ux0) + 1, 2 * (uz1 - uz0) + 1
+    matrix = [["0"] * cols for _ in range(rows)]
+    # walls: edges first, then the vertices they touch
+    for i in range(rows):
+        for j in range(cols):
+            if i % 2 == j % 2:
+                continue
+            cx = START_X + 3 * j + 6 * ux0 - 6
+            cz = START_Z + 3 * i + 6 * uz0 - 6
+            if edge_has_wall(cx, cz, along_x=(i % 2 == 0)):
+                matrix[i][j] = "1"
+    for i in range(0, rows, 2):
+        for j in range(0, cols, 2):
+            if any(0 <= i + di < rows and 0 <= j + dj < cols and matrix[i + di][j + dj] == "1" for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1))):
+                matrix[i][j] = "1"
+    # floor tiles (12 cm): whichever floor type has the most cells in the tile, if enough
+    counts = Counter()
+    for name, code in TILE_CODES.items():
+        for x, z in FLOORS[name]["cells"]:
+            counts[((x - START_X + 6) // 12, (z - START_Z + 6) // 12, name)] += 1
+    best = {}
+    for (tx, tz, name), n in counts.items():
+        needed = 40 if FLOORS[name]["blocked"] else 5
+        if n >= needed and n > best.get((tx, tz), (0, None))[0]:
+            best[(tx, tz)] = (n, name)
+    for (tx, tz), (n, name) in best.items():
+        kx, kz = tx - ux0 // 2, tz - uz0 // 2
+        for i in (4 * kz + 1, 4 * kz + 3):
+            for j in (4 * kx + 1, 4 * kx + 3):
+                if 0 <= i < rows and 0 <= j < cols:
+                    matrix[i][j] = TILE_CODES[name]
+    # start tile
+    for i in (-2 * uz0 + 1, -2 * uz0 + 3):
+        for j in (-2 * ux0 + 1, -2 * ux0 + 3):
+            if 0 <= i < rows and 0 <= j < cols and matrix[i][j] == "0":
+                matrix[i][j] = "5"
+    # reported tokens go on the wall edge they were read from
+    angle = math.radians(start_heading)
+    forward = (-math.sin(angle), -math.cos(angle))
+    right = (math.cos(angle), -math.sin(angle))
+    for entry in seen_tokens:
+        if entry["status"] != "reported" or not entry["type"]:
+            continue
+        dx, dz = entry["x"] - start_gps[0], entry["z"] - start_gps[1]
+        f_cm = (dx * forward[0] + dz * forward[1]) * 100
+        r_cm = (dx * right[0] + dz * right[1]) * 100
+        n_f = entry["nx"] * forward[0] + entry["nz"] * forward[1]
+        n_r = entry["nx"] * right[0] + entry["nz"] * right[1]
+        u_f, u_r = (f_cm + 6) / 6, (r_cm + 6) / 6
+        if abs(n_f) >= abs(n_r):
+            # wall across the forward direction: a vertical edge (even column, odd row)
+            j = 2 * (2 * round(u_f / 2) - ux0)
+            i = 2 * math.floor(2 * (u_r - uz0) / 2) + 1
+        else:
+            i = 2 * (2 * round(u_r / 2) - uz0)
+            j = 2 * math.floor(2 * (u_f - ux0) / 2) + 1
+        if 0 <= i < rows and 0 <= j < cols:
+            old = matrix[i][j]
+            matrix[i][j] = entry["type"] if old in ("0", "1") else old + entry["type"]
+    return matrix
+
+# send the map, ask for it to be marked, then the exit message that makes it count
+def send_map(reason):
+    global map_sent
+    if map_sent:
+        return
+    map_sent = True
+    if emitter is None:
+        print("MAP NOT SENT: emitter device is unavailable")
+        return
+    matrix = build_map_matrix()
+    if matrix is None:
+        print("MAP NOT SENT: no walls have been mapped yet")
+        return
+    rows, cols = len(matrix), len(matrix[0])
+    emitter.send(struct.pack("2i", rows, cols) + ",".join(cell for row in matrix for cell in row).encode("utf-8"))
+    emitter.send(struct.pack("c", b"M"))
+    emitter.send(struct.pack("c", b"E"))
+    print()
+    print("MAP SENT (" + reason + ") |", rows, "rows x", cols, "columns")
+    for row in matrix:
+        print(" ".join(row))
+
 # Stop the robot, perform one final scan, print statistics and the cropped map,
 # then remain in FINISHED for all later control cycles.
 def finish(reason):
@@ -688,6 +890,7 @@ def finish(reason):
     print("Wall tokens reported:", len(reported), [t["type"] for t in reported])
     print("Wall tokens ignored:", sum(1 for t in seen_tokens if t["status"] != "reported"))
     print_map(final_x, final_z)
+    send_map("finished: " + reason)
     state = "FINISHED"
 
 #vision - erebus colours are flat so simple thresholds work fine
@@ -1035,6 +1238,13 @@ def remember_token(position, status, token_type=None, kind=None):
     if status == "failed":
         entry["attempts"] += 1
 
+# remember the token under both the spot where it was first seen and the spot measured later,
+# so the same sighting is recognised (and its failed attempts counted) next time
+def remember_current(status, token_type=None):
+    remember_token(tok["seen_position"], status, token_type, tok["kind"])
+    if tok["position"] != tok["seen_position"]:
+        remember_token(tok["position"], status, token_type, tok["kind"])
+
 # saves both cameras to the pics folder
 def save_frames():
     folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), PIC_FOLDER)
@@ -1081,6 +1291,12 @@ def look_for_new_token(resume_state):
         wall = side_wall_distance(camera)
         if not math.isfinite(wall) or wall > MAX_WALL:
             continue
+        if sighting["kind"] == "cognitive":
+            # how far away the target looks from its size: if it is much further than the near wall the lidar sees,
+            # it is on a far wall seen through a gap, so ignore it for now
+            implied = focal_length(camera) * TARGET_R / sighting["size"] + camera["lens_offset"]
+            if implied > MAX_WALL + 0.03:
+                continue
         position = estimate_token_position(camera, wall, image_error(camera, sighting))
         if token_is_handled(position, sighting["kind"]):
             continue
@@ -1108,7 +1324,7 @@ def begin_token(camera, sighting, position, resume_state, track_bands=None):
     bands = [Counter() for _ in range(5)]
     if sighting["kind"] == "cognitive":
         add_bands(bands, track_bands or sighting["bands"])
-    tok = {"bands": bands, "scanned": False, "scan_targets": [], "after_scan": "", "read_type": None, "camera": camera, "kind": sighting["kind"], "position": position, "resume_state": resume_state, "move_progress": ((left_encoder.getValue() - start_l) + (right_encoder.getValue() - start_r)) / 2, "pause_encoder": average_encoder(), "base_heading": cardinal(heading), "align_start": average_encoder(), "segment_direction": None, "segment_start": 0.0, "segment_error": 0.0, "lost_frames": 0, "last_drive": 0, "recover_drive": 0, "settle": 0, "approached": False, "approach_start": 0.0, "approach_distance": 0.0, "align_votes": Counter(), "votes": Counter(), "report_start": 0.0, "hold": 0, "off_px": 0.0,}
+    tok = {"bands": bands, "scanned": False, "scan_targets": [], "after_scan": "", "read_type": None, "camera": camera, "kind": sighting["kind"], "position": position, "seen_position": position, "resume_state": resume_state, "move_progress": ((left_encoder.getValue() - start_l) + (right_encoder.getValue() - start_r)) / 2, "pause_encoder": average_encoder(), "base_heading": cardinal(heading), "align_start": average_encoder(), "segment_direction": None, "segment_start": 0.0, "segment_error": 0.0, "lost_frames": 0, "last_drive": 0, "recover_drive": 0, "settle": 0, "approached": False, "approach_start": 0.0, "approach_distance": 0.0, "align_votes": Counter(), "votes": Counter(), "report_start": 0.0, "hold": 0, "off_px": 0.0,}
     print()
     print("========================================")
     print("NEW WALL TOKEN SEEN")
@@ -1125,7 +1341,7 @@ def begin_token(camera, sighting, position, resume_state, track_bands=None):
 # give up (can retry once)
 def abort_token(reason):
     set_wheels(0, 0)
-    remember_token(tok["position"], "failed", None, tok["kind"])
+    remember_current("failed")
     print()
     print("TOKEN ABORTED:", reason)
     end_token()
@@ -1227,7 +1443,7 @@ def resolve_reading(after):
         return None
     if reading in ("fake", "flat"):
         print("Not a valid hazard (" + reading + "): not reported.")
-        remember_token(tok["position"], "ignored", reading, tok["kind"])
+        remember_current("ignored", reading)
         end_token()
         return None
     return reading
@@ -1235,7 +1451,7 @@ def resolve_reading(after):
 def send_and_hold(code):
     global state
     if send_report(code):
-        remember_token(tok["position"], "reported", code, tok["kind"])
+        remember_current("reported", code)
         tok["hold"] = HOLD_STEPS
         state = "TOKEN_HOLD"
     else:
@@ -1253,6 +1469,13 @@ print("Camera FOV (rad):", round(camera1.getFov(), 3), round(camera2.getFov(), 3
 while robot.step(timestep) != -1:
     if start_heading is not None:
         heading = get_relative_heading()
+    # time is nearly up: send what has been mapped so far and stop
+    if start_heading is not None and not map_sent and robot.getTime() >= GAME_TIME - MAP_SEND_BEFORE_END:
+        set_wheels(0, 0)
+        print()
+        print(f"{MAP_SEND_BEFORE_END:.0f} s left: sending the map.")
+        send_map("time nearly up")
+        state = "FINISHED"
     # first scan
     if state == "WAIT":
         set_wheels(0, 0)
@@ -1276,13 +1499,14 @@ while robot.step(timestep) != -1:
         average_change = (abs(left_encoder.getValue() - start_l) + abs(right_encoder.getValue() - start_r)) / 2
         rgb = read_colour()
         floor = classify_floor(*rgb)
-        if floor == "silver":
+        if floor is not None and not FLOORS[floor]["blocked"]:
             cell = gps_to_map()[:2]
-            if cell not in FLOORS["silver"]["cells"]:
-                FLOORS["silver"]["cells"].add(cell)
-                print()
-                print("SILVER CHECKPOINT DETECTED | RGB:", rgb, "| map position:", cell)
-        elif floor is not None and FLOORS[floor]["blocked"]:
+            if cell not in FLOORS[floor]["cells"]:
+                FLOORS[floor]["cells"].add(cell)
+                if len(FLOORS[floor]["cells"]) % 25 == 1:
+                    print()
+                    print(f"{FLOORS[floor]['log']} DETECTED | RGB:", rgb, "| map position:", cell)
+        elif floor is not None:
             set_wheels(0, 0)
             map_x, map_z, _, _ = gps_to_map()
             mark_floor_region(map_x, map_z, heading, floor)
@@ -1307,6 +1531,12 @@ while robot.step(timestep) != -1:
             continue
         if average_change >= STEP_ENC:
             set_wheels(0, 0)
+            if step_start_gps is not None:
+                now_gps = gps.getValues()
+                moved = math.hypot(now_gps[0] - step_start_gps[0], now_gps[2] - step_start_gps[2])
+                if moved < STUCK_MOVE:
+                    begin_unstick(f"a 6 cm step moved the robot only {moved * 100:.1f} cm")
+                    continue
             slow_steps = max(0, slow_steps - 1)
             pass_steps += 1
             total_steps += 1
@@ -1443,7 +1673,37 @@ while robot.step(timestep) != -1:
         else:
             pass_steps = 0
             start_turn(action)
+    elif state == "UNSTICK_BACK":
+        pos = gps.getValues()
+        backed = math.hypot(pos[0] - unstick_start[0], pos[2] - unstick_start[2])
+        if backed < unstick_dist and robot.getTime() - unstick_time < UNSTICK_TIME and get_back_lidar() > STOP_DIST:
+            set_wheels(-BACK_SPEED, -BACK_SPEED)
+            continue
+        set_wheels(0, 0)
+        # take the most open way that is not straight ahead and not into known hazard floor
+        options = []
+        for name, clearance, turn in (("Left", get_left_turn_clearance(), 90), ("Right", get_right_lidar(), -90), ("Back", get_back_lidar(), 180)):
+            if not direction_has_blocked_floor(turn):
+                options.append((clearance, turn, name))
+        options.sort(reverse=True)
+        choice = options[0] if options else (0.0, 180, "Back")
+        if stuck_streak >= 3:
+            choice = next((o for o in options if o[2] == "Back"), choice)
+        print(f"Backed off {backed * 100:.1f} cm. Turning {choice[2].lower()} (clearance {choice[0]:.3f} m) to try another way.")
+        uturn_pending = False
+        passes += 1
+        pass_steps = 0
+        start_turn(choice[1])
     elif state == "TURN":
+        # a turn that is far from its target and not getting closer is also a jam
+        turn_error = abs(angle_error(target_heading, heading))
+        if turn_watch is None:
+            turn_watch = (robot.getTime(), turn_error)
+        elif robot.getTime() - turn_watch[0] >= TURN_WATCH_TIME:
+            if turn_error > 10 and turn_watch[1] - turn_error < 2.0:
+                begin_unstick("a turn is not getting any closer to its target")
+                continue
+            turn_watch = (robot.getTime(), turn_error)
         # first 90 of a 180 is slow, then we stop for longer so the cameras can look
         if turn_toward(target_heading, UTURN_SPEED if uturn_pending else None):
             wait_steps = UTURN_WAIT if uturn_pending else 10
