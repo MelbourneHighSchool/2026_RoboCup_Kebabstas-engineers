@@ -23,6 +23,8 @@
 # 180 degree turns are done as two 90 degree turns. The first 90 is slow and is
 # followed by a pause where both cameras check for tokens.
 
+#V3
+
 # Imports   
 import math
 import os
@@ -50,7 +52,8 @@ colour_sensor = robot.getDevice("colour_sensor")
 camera1 = robot.getDevice("camera1")
 camera2 = robot.getDevice("camera2")
 emitter = robot.getDevice("emitter")
-for device in (left_encoder, right_encoder, gps, imu, lidar, colour_sensor, camera1, camera2):
+receiver = robot.getDevice("receiver")
+for device in (left_encoder, right_encoder, gps, imu, lidar, colour_sensor, camera1, camera2, receiver):
     device.enable(timestep)
 print("Emitter ready." if emitter else "WARNING: emitter not found. Token reporting is unavailable.")
 
@@ -78,7 +81,7 @@ WALL_NEAR = 9  # a spot this close (cm) to a wall or unknown space is worth visi
 LAP_AWAY = 0.30  # m the robot must get from the start before coming back counts as a lap
 LAP_HOME = 0.10  # m from the start (GPS) that counts as back home
 STALL_STEPS = 30  # steps without reaching a new spot before the lap is ended early
-GAME_TIME = 480.0  # s, length of the run (8 min); set this to your event's time limit
+GAME_TIME = 30.0  # s, length of the run (8 min); set this to your event's time limit
 MAP_SEND_BEFORE_END = 15.0  # s: send the map this long before the run ends if exploring has not finished
 STUCK_MOVE = 0.02  # m: a 6 cm step that moved the robot less than this (GPS) means it is jammed
 TURN_WATCH_TIME = 1.5  # s between checks that a turn is getting closer to its target
@@ -1463,14 +1466,76 @@ def finish_report():
     code = resolve_reading("TOKEN_MEASURE")
     if code:
         send_and_hold(code)
+
+def receive():
+    """Recieve packets from supervisor"""
+    global remaining_time
+    if not receiver:
+        return
+    while receiver.getQueueLength() > 0:
+        data = receiver.getBytes()
+        print(f"[byte] received, length {len(data)}, byte is {data}")
+        if len(data) == 16:
+            print(f"[byte] length is 16")
+            tag, _, seconds_left = struct.unpack("c3xfi4x", data)
+            if tag == b"G":
+                print(f"[byte] tag is G (Game info)")
+                remaining_time = seconds_left
+        if len(data) == 1:
+            if data == b"L":
+                print(f"[LOP] Lack of progress detected")
+                #lack_of_progress_response()
+        receiver.nextPacket()
+
+def ask_remaining_time():
+    emitter.send(bytes("G", "UTF-8"))
+
+
+LEAVE_DIST = 0.15
+BACK_MARGIN = 0.01
+def back_to_start():
+    global start_position, left_start, loop_time, exit_sent
+    if state == "WAIT" or exit_sent:
+        return
+    position = gps.getValues()
+    if start_position is None:
+        start_position = position
+        return
+    #print(f"[back to start check] start positon: {start_position}, position: {position}, BACK_MARGIN: {BACK_MARGIN}")
+    at_start = all(abs(position[i] - start_position[i]) <= BACK_MARGIN for i in range(3))
+    print(f"[back to start check] at start: {at_start}")
+    if not at_start:
+        if not left_start:
+            moved = math.hypot(position[0] - start_position[0], position[2] - start_position[2])
+            if moved >= LEAVE_DIST:
+                left_start = True
+        return
+    if not left_start:
+        return
+    left_start = False  # one check per return, needs to leave again before the next
+    if loop_time is None:
+        loop_time = GAME_TIME - remaining_time
+        print("Back at the start. First lap took", loop_time, "s")
+    print("Back at the start | time left:", remaining_time, "s | lap time:", loop_time, "s")
+    if remaining_time <= loop_time:
+        print("Not enough time for another lap: sending exit signal.")
+        if emitter:
+            emitter.send(bytes("E", "utf-8"))
+        exit_sent = True
+        finish("back at the start with no time for another lap")
+    
 #main loop
 print("Hazard-aware left-boundary wall-following controller started. [token controller v4]")
 print("Camera FOV (rad):", round(camera1.getFov(), 3), round(camera2.getFov(), 3))
+remaining_time = GAME_TIME
 while robot.step(timestep) != -1:
     if start_heading is not None:
         heading = get_relative_heading()
     # time is nearly up: send what has been mapped so far and stop
-    if start_heading is not None and not map_sent and robot.getTime() >= GAME_TIME - MAP_SEND_BEFORE_END:
+    ask_remaining_time()
+    receive()
+    print(f"[remaining time] {remaining_time}")
+    if start_heading is not None and not map_sent and GAME_TIME - remaining_time >= GAME_TIME - MAP_SEND_BEFORE_END:
         set_wheels(0, 0)
         print()
         print(f"{MAP_SEND_BEFORE_END:.0f} s left: sending the map.")
