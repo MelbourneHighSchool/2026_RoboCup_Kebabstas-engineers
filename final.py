@@ -22,8 +22,10 @@
 #
 # 180 degree turns are done as two 90 degree turns. The first 90 is slow and is
 # followed by a pause where both cameras check for tokens.
+#
+# Fake victims are skipped over and not reported
 
-#V3
+#V4
 
 # Imports   
 import math
@@ -81,7 +83,7 @@ WALL_NEAR = 9  # a spot this close (cm) to a wall or unknown space is worth visi
 LAP_AWAY = 0.30  # m the robot must get from the start before coming back counts as a lap
 LAP_HOME = 0.10  # m from the start (GPS) that counts as back home
 STALL_STEPS = 30  # steps without reaching a new spot before the lap is ended early
-GAME_TIME = 30.0  # s, length of the run (8 min); set this to your event's time limit
+GAME_TIME = 480.0  # s, length of the run (8 min); set this to your event's time limit
 MAP_SEND_BEFORE_END = 15.0  # s: send the map this long before the run ends if exploring has not finished
 STUCK_MOVE = 0.02  # m: a 6 cm step that moved the robot less than this (GPS) means it is jammed
 TURN_WATCH_TIME = 1.5  # s between checks that a turn is getting closer to its target
@@ -876,25 +878,9 @@ def send_map(reason):
 # Stop the robot, perform one final scan, print statistics and the cropped map,
 # then remain in FINISHED for all later control cycles.
 def finish(reason):
-    global state
-    set_wheels(0, 0)
-    final_x, final_z, _, _ = gps_to_map()
-    scan_map(final_x, final_z, heading)
-    print()
-    print("Finished:", reason)
-    print("Straight passes completed:", passes)
-    print("Steps completed in current pass:", pass_steps)
-    print("Total 6 cm steps:", total_steps)
-    print("Final heading:", round(heading, 2), "degrees")
-    print("Scanned wall cells:", len(side_walls))
-    for region in FLOORS.values():
-        print(f"{region['hazard'].capitalize()} cells:", len(region["cells"]))
-    reported = [t for t in seen_tokens if t["status"] == "reported"]
-    print("Wall tokens reported:", len(reported), [t["type"] for t in reported])
-    print("Wall tokens ignored:", sum(1 for t in seen_tokens if t["status"] != "reported"))
-    print_map(final_x, final_z)
-    send_map("finished: " + reason)
-    state = "FINISHED"
+    global finished
+    print(f"finished, reason: {reason}")
+    finished = True
 
 #vision - erebus colours are flat so simple thresholds work fine
 def get_frame(camera):
@@ -1474,12 +1460,9 @@ def receive():
         return
     while receiver.getQueueLength() > 0:
         data = receiver.getBytes()
-        print(f"[byte] received, length {len(data)}, byte is {data}")
         if len(data) == 16:
-            print(f"[byte] length is 16")
             tag, _, seconds_left = struct.unpack("c3xfi4x", data)
             if tag == b"G":
-                print(f"[byte] tag is G (Game info)")
                 remaining_time = seconds_left
         if len(data) == 1:
             if data == b"L":
@@ -1501,9 +1484,7 @@ def back_to_start():
     if start_position is None:
         start_position = position
         return
-    #print(f"[back to start check] start positon: {start_position}, position: {position}, BACK_MARGIN: {BACK_MARGIN}")
     at_start = all(abs(position[i] - start_position[i]) <= BACK_MARGIN for i in range(3))
-    print(f"[back to start check] at start: {at_start}")
     if not at_start:
         if not left_start:
             moved = math.hypot(position[0] - start_position[0], position[2] - start_position[2])
@@ -1517,24 +1498,43 @@ def back_to_start():
         loop_time = GAME_TIME - remaining_time
         print("Back at the start. First lap took", loop_time, "s")
     print("Back at the start | time left:", remaining_time, "s | lap time:", loop_time, "s")
-    if remaining_time <= loop_time:
-        print("Not enough time for another lap: sending exit signal.")
+    if remaining_time <= loop_time or finished:
+        print("Not enough time for another lap or robot has finished its exploration: sending exit signal.")
         if emitter:
+            send_map("Reached back start and getting exit bonus")
             emitter.send(bytes("E", "utf-8"))
         exit_sent = True
         finish("back at the start with no time for another lap")
+
+def is_fake_victim(camera, sighting):
+    """Checks if victim is fake by comparing the lidar reading and check the distance from the victim compared to from the wall, as fake victims are 3d"""
+    wall_distance = side_wall_distance(camera)
+    print(f"wall distance: {wall_distance}")
+    apparent_size = sighting["size"]
+    print(f"apparent size: {apparent_size}")
+    depth = wall_distance - apparent_size # Distance difference from wall and victim
+    print(f"depth: {depth}")
+    if abs(depth) > 40: # If bigger than 0 (It is 3D)
+        return True
+    return False
+
     
 #main loop
 print("Hazard-aware left-boundary wall-following controller started. [token controller v4]")
 print("Camera FOV (rad):", round(camera1.getFov(), 3), round(camera2.getFov(), 3))
 remaining_time = GAME_TIME
+exit_sent = None
+start_position = None
+left_start = None
+loop_time = None
+finished = False
 while robot.step(timestep) != -1:
     if start_heading is not None:
         heading = get_relative_heading()
     # time is nearly up: send what has been mapped so far and stop
     ask_remaining_time()
     receive()
-    print(f"[remaining time] {remaining_time}")
+    back_to_start()
     if start_heading is not None and not map_sent and GAME_TIME - remaining_time >= GAME_TIME - MAP_SEND_BEFORE_END:
         set_wheels(0, 0)
         print()
@@ -1885,6 +1885,12 @@ while robot.step(timestep) != -1:
         wall = side_wall_distance(camera)
         tok["position"] = estimate_token_position(camera, wall, tok["off_px"])
         print("Side wall distance at token:", round(wall, 4), "m (report limit", REPORT_DIST, "m)")
+        if tok["kind"] == "victim":
+            if is_fake_victim(camera, sighting):
+                remember_current("ignored", "fake")
+                print("Fake victim detected.")
+                end_token()
+                continue
         if wall <= REPORT_DIST:
             tok["report_start"] = robot.getTime()
             print(f"Holding still for {STOP_TIME} s and reading the token.")
